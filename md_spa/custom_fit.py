@@ -3193,3 +3193,147 @@ def _d_gamma_distribution(params, xarray, yarray, switch=None, weighting=None,):
 
     return np.transpose(np.array(output))
 
+def exp_damped_sine(xdata, ydata, minimizer="leastsq", weighting=None, kwargs_minimizer={}, kwargs_parameters={}, verbose=False,):
+    r"""
+    Provided data fit to: :math:`y = A_{1} \exp(-\lambda_{1} t) \cos(\omega t + \phi) + A_{2} \exp(-\lambda_{2} t)
+
+    Values of zero and NaN are ignored in the fit.
+
+    Parameters
+    ----------
+    xdata : numpy.ndarray
+        independent data set
+    ydata : numpy.ndarray
+        dependent data set
+    minimizer : str, default="leastsq"
+        Fitting method supported by `lmfit.minimize <https://lmfit.github.io/lmfit-py/fitting.html#lmfit.minimizer.minimize>`_
+    weighting : numpy.ndarray, default=None
+        Of the same length as the provided data, contains the weights for each data point.
+    kwargs_minimizer : dict, default={}
+        Keyword arguments for `lmfit.minimize <https://lmfit.github.io/lmfit-py/fitting.html#lmfit.minimizer.minimize>`_
+    kwargs_parameters : dict, Optional
+        Dictionary containing the following variables and their default keyword arguments in the form ``kwargs_parameters = {"var": {"kwarg1": var1...}}`` where ``kwargs1...`` are those from `lmfit.Parameters.add <https://lmfit.github.io/lmfit-py/parameters.html#lmfit.parameter.Parameters>`_ and ``var`` is one of the following parameter names.
+
+        - ``"A1" = {"value": 1, "min": 0, "max":100}``
+        - ``"lambda1 = {"value": 0, "min": 0, "max":100}``
+        - ``"phi = {"value": 0, "min": -2*pi, "max":2*pi}``
+        - ``"omega = {"value": 1, "min": 0, "max":100}``
+        - ``"A2" = {"value": 1, "min": 0, "max":100}``
+        - ``"lambda2 = {"value": 0, "min": 0, "max":100}``
+
+    verbose : bool, default=False
+        Output fitting statistics
+
+    Returns
+    -------
+    parameters : numpy.ndarray
+        Array containing parameters: ["A1", "lambda1", "phi", "omega", "A2", "lambda2"]
+    stnd_errors : numpy.ndarray
+        Array containing parameter standard errors: ["A1", "lambda1", "phi", "omega", "A2", "lambda2"]
+    redchi : float
+        Reduced Chi^2 from `lmfit.MinimizerResult <https://lmfit.github.io/lmfit-py/fitting.html#lmfit.minimizer.MinimizerResult>`_
+        
+    """
+
+    kwargs_min = copy.deepcopy(kwargs_minimizer)
+    
+    if np.all(weighting != None):
+        if minimizer == "emcee":
+            kwargs_min["is_weighted"] = True
+        weighting = weighting[ydata>0]
+        if np.all(np.isnan(weighting[1:])):
+            weighting = None
+    elif minimizer == "emcee":
+        kwargs_min["is_weighted"] = False
+    kwargs_min.update({"nan_policy": "omit"})
+
+    xarray = xdata[ydata>0]
+    yarray = ydata[ydata>0]
+    if np.all(np.isnan(ydata[1:])):
+        raise ValueError("y-axis data is NaN")
+
+    param_kwargs = {
+        "A1": {"value": 1, "min": np.finfo(float).eps, "max":1e+2},
+        "lambda1": {"value": 0, "min": np.finfo(float).eps, "max":1e+2},
+        "phi": {"value": 1, "min": -2*np.pi, "max":2*np.pi},
+        "omega": {"value": 1, "min": np.finfo(float).eps, "max":1e+2},
+        "A2": {"value": 1, "min": np.finfo(float).eps, "max":1e+2},
+        "lambda2": {"value": 0, "min": np.finfo(float).eps, "max":1e+2},
+    }
+    for key, value in kwargs_parameters.items():
+        if key in param_kwargs:
+            param_kwargs[key].update(value)
+        else:
+            raise ValueError("The parameter, {}, was given to custom_fit.exp_damped_sine, which requires parameters: 'alpha' and 'beta'".format(key))
+
+    switch = [True for x in range(len(param_kwargs))]
+    for i, (key, value) in enumerate(param_kwargs.items()):
+        if "vary" in value and value["vary"] == False:
+            switch[i] = False
+        if "expr" in value:
+            switch[i] = False
+
+    exp1 = Parameters()
+    exp1.add("A1", **param_kwargs["A1"])
+    exp1.add("lambda1", **param_kwargs["lambda1"])
+    exp1.add("phi", **param_kwargs["phi"])
+    exp1.add("omega", **param_kwargs["omega"])
+    exp1.add("A2", **param_kwargs["A2"])
+    exp1.add("lambda2", **param_kwargs["lambda2"])
+    if minimizer in ["leastsq"]:
+        kwargs_min["Dfun"] = _d_exp_damped_sine
+    Result1 = lmfit.minimize(_res_exp_damped_sine, exp1, method=minimizer, args=(xarray, yarray), kws={"switch": switch, "weighting": weighting,}, **kwargs_min)
+
+    # Format output
+    output = np.zeros(len(param_kwargs))
+    uncertainties = np.zeros(len(param_kwargs))
+    for i,(param, value) in enumerate(Result1.params.items()):
+        if i >= len(param_kwargs):
+            continue
+        output[i] = value.value
+        uncertainties[i] = value.stderr
+
+    if verbose:
+        if minimizer == "leastsq":
+            print("Termination: {}".format(Result1.lmdif_message))
+        elif minimizer == "emcee":
+            print("Termination:  Success? {}, Aborted? {}, Chi^2: {}".format(Result1.success, Result1.aborted, Result1.chisqr))
+        else:
+            print("Termination: {}".format(Result1.message))
+        lmfit.printfuncs.report_fit(Result1.params)
+
+    return output, uncertainties, Result1.redchi
+
+def _res_exp_damped_sine(params, xarray, yarray, switch=None, weighting=None,):
+    term1 = params["A1"] * np.exp(-params["lambda1"] * xarray)
+    term2 = np.cos(params["omega"] * xarray + params["phi"])
+    term3 = params["A2"] * np.exp(-params["lambda2"] * xarray)
+    out = term1 * term2 + term3 - yarray
+    if np.all(weighting != None):
+        if len(weighting) != len(out):
+            raise ValueError("Length of `weighting` array must be of equal length to input data arrays")
+        out = out*np.array(weighting)
+    return out
+
+def _d_exp_damped_sine(params, xarray, yarray, switch=None, weighting=None,):
+    term1 = np.exp(-params["lambda1"] * xarray)
+    term2 = np.cos(params["omega"] * xarray + params["phi"])
+    term3 = np.exp(-params["lambda2"] * xarray)
+
+    tmp_output = []
+    tmp_output.append(term1)
+    tmp_output.append(-params["A1"] * xarray * term1 * term2)
+    tmp_output.append(-term1 * np.sin(params["omega"] * xarray + params["phi"]))
+    tmp_output.append(-term1 * np.sin(params["omega"] * xarray + params["phi"]))
+    tmp_output.append(term3)
+    tmp_output.append(-params["A2"] * xarray * term3)
+
+    output = []
+    if np.all(switch != None):
+        for i, tf in enumerate(switch):
+            if tf:
+                output.append(tmp_output[i])
+    else:
+        output = tmp_output
+
+    return np.transpose(np.array(output))
